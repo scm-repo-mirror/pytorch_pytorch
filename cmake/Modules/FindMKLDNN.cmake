@@ -45,6 +45,7 @@ IF(NOT MKLDNN_FOUND)
         list(APPEND DNNL_MAKE_COMMAND "--" "-l" "$ENV{MAX_JOBS}")
       endif()
     endif()
+    message("sccache debug: XPU_MKLDNN_DIR_PREFIX -> ${XPU_MKLDNN_DIR_PREFIX}")
     ExternalProject_Add(xpu_mkldnn_proj
       GIT_REPOSITORY https://github.com/uxlfoundation/oneDNN
       GIT_TAG v3.9.1
