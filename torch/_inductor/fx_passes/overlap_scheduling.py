@@ -119,6 +119,35 @@ def is_compute_node(n: fx.Node) -> bool:
     )
 
 
+def estimate_mem_bound_runtime_ms(node: fx.Node) -> float:
+    """Estimate runtime for a memory-bound node based on input/output bytes.
+
+    Returns 0 for view nodes (no memory cost).
+    """
+    from torch._inductor.fx_passes.fusion_regions import is_view_node
+    from torch._inductor.utils import get_gpu_dram_gbps
+    from torch.utils._runtime_estimation import get_num_bytes
+
+    if is_view_node(node):
+        return 0.0
+
+    def get_node_bytes(n: fx.Node) -> int:
+        val = n.meta.get("val")
+        return get_num_bytes(val) if isinstance(val, torch.Tensor) else 0
+
+    total_bytes = 0
+    for inp in node.all_input_nodes:
+        total_bytes += get_node_bytes(inp)
+    total_bytes += get_node_bytes(node)
+
+    if total_bytes == 0:
+        return 0.0
+
+    bw_gbps = get_gpu_dram_gbps()
+    bw_bytes_per_s = bw_gbps * 1e9
+    return (total_bytes / bw_bytes_per_s) * 1000
+
+
 def get_hint(x: int | torch.SymInt) -> int | None:
     if isinstance(x, int):
         return x
@@ -295,6 +324,22 @@ class OverlapScheduler:
         self.insert_overlap_deps = insert_overlap_deps
         self.max_compute_pre_fetch = max_compute_pre_fetch
         self.collective_estimator = collective_estimator
+
+        # Build and collapse fusion regions FIRST so all subsequent operations
+        # work on the collapsed graph where fused ops are atomic units
+        self.region_of: dict[fx.Node, Any] = {}
+        self.fusion_replaced: dict[fx.Node, fx.Node] = {}
+        if torch._inductor.config.test_configs.enable_fusion_regions:
+            from torch._inductor.fx_passes.fusion_regions import (
+                build_fusion_regions,
+                collapse_fusion_regions,
+            )
+
+            self.region_of = build_fusion_regions(self.gm)
+            if self.region_of:
+                self.region_of, self.fusion_replaced = collapse_fusion_regions(
+                    self.gm, self.region_of
+                )
 
         # Build structures
         stable_topological_sort(self.graph)
@@ -732,52 +777,48 @@ class OverlapScheduler:
 
         self._reorder_graph()
 
-        if self.collective_bucketing:
-            self._bucket_collectives()
-        elif self.insert_overlap_deps:
-            # If not bucketing, add effect tokens to preserve hiding dependencies
-            self._add_effect_tokens_for_overlap()
+        # Step 3: Bucketing, fusion region expansion, and deps
+        from torch._inductor.fx_passes.overlap_preserving_bucketer import (
+            OverlapPreservingBucketer,
+        )
+
+        bucketer = OverlapPreservingBucketer(
+            gm=self.gm,
+            collective_info=self.collective_info,
+            scheduled=self.scheduled,
+            max_bucket_memory_gb=2.0,
+            max_coll_distance=self.max_node_distance,
+            insert_overlap_deps=self.insert_overlap_deps,
+            collective_bucketing=self.collective_bucketing,
+            region_of=self.region_of,
+            fusion_replaced=self.fusion_replaced,
+        )
+        bucketer.run()
 
         return self.gm
 
-    def _add_effect_tokens_for_overlap(self) -> None:
-        """
-        Add effect tokens to preserve hiding dependency relationships when not bucketing.
-
-        This ensures that communication-compute overlap is preserved through effect tokens
-        when overlap preserving bucketing is not enabled.
-        """
-        from torch._inductor.fx_passes.control_dependencies import (
-            preserve_node_ordering,
-        )
-
-        # Collect hiding dependencies: hiding_node -> collective_start, wait -> hiding_node
-        additional_deps: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
-
-        for start_node, info in self.collective_info.items():
-            if info.is_exposed:
-                continue
-            for hn in info.hiding_nodes:
-                # Compute depends on collective start (compute must wait for collective to start)
-                additional_deps[hn].add(start_node)
-                # Wait depends on compute (wait must wait for compute to finish)
-                additional_deps[info.wait_node].add(hn)
-
-        # Apply effect tokens to preserve these dependencies
-        if additional_deps:
-            preserve_node_ordering(self.graph, additional_deps)
-
     def get_non_collective_runtime_estimate(self, node: fx.Node) -> float | None:
         """Get runtime estimation for a node in ms. Returns None if no estimation is available."""
-
-        # TODO: non custom estimation of aten nodes, potentially requires notion of fusion group
         if is_compute_node(node):
             return benchmark_node(node, self.custom_runtime_estimation)
 
-        if self.custom_runtime_estimation is None:
+        if self.custom_runtime_estimation is not None:
+            if (est := self.custom_runtime_estimation(node, None)) is not None:
+                return est
+            # Custom estimation provided but returned None - don't fall through to fusible estimation
             return None
 
-        return self.custom_runtime_estimation(node, None)
+        # Use precomputed cost for fusion region call_module nodes
+        if node in self.region_of:
+            return self.region_of[node].cost_ms
+
+        # Estimate fusible nodes (pointwise, reduction, etc.) as memory-bound
+        from torch._inductor.fx_passes.fusion_regions import is_fusible_node
+
+        if is_fusible_node(node):
+            return estimate_mem_bound_runtime_ms(node)
+
+        return None
 
     def _reduce_exposed_time_of_in_flight_collectives(
         self,
