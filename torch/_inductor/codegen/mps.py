@@ -212,13 +212,8 @@ class MetalOverrides(OpOverrides):
     @staticmethod
     def masked(mask: CSEVariable, body: sympy.Expr, other: CSEVariable) -> str:
         # TODO: Type annotation for other is wrong, it's often float or int
-        with V.kernel.mask_loads(mask, other) as new_mask:
-            result = body()
-
-        if result.bounds.is_bool:
-            other = bool(other)  # type: ignore[assignment]
-
-        return ops.where(new_mask, result, other)
+        with V.kernel.mask_loads(mask, other):
+            return body()
 
     @staticmethod
     def where(a: OpVarT, b: OpVarT, c: OpVarT) -> str:
@@ -498,13 +493,20 @@ class MetalKernel(SIMDKernel):
         index = self.prepare_indexing(index)
         dtype = V.graph.get_dtype(name)
         line = f"{var}[{self.index_to_str(index)}]"
+        if self._load_mask:
+            assert self._load_other is not None
+            val_type = f"::metal::remove_reference_t<decltype({var}[0])>"
+            cast_other = f"static_cast<{val_type}>({value_to_metal(self._load_other)})"
+            line = f"{self._load_mask} ? {line} : {cast_other}"
         if dtype in [torch.float16, torch.bfloat16]:
             # TODO(NS): Figure out the right balance between optype casts
             # op_math_t for half-precision floats should be float32
             # Otherwise it can lead to a correctness issues with eager
             line = f"static_cast<float>({line})"
             dtype = torch.float32
-        return self.cse.generate(self.loads, line, dtype=dtype)
+        return self.cse.generate(
+            self.loads if self._load_mask is None else self.compute, line, dtype=dtype
+        )
 
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
@@ -1050,14 +1052,21 @@ class MetalKernel(SIMDKernel):
         # TODO(malfet): support asserts
         # See https://github.com/pytorch/pytorch/issues/144634
         expr_str = self.index_to_str(expr)
-        lower_expr = f"{expr_str} < 0" if lower else ""
+        size_str = self.index_to_str(size)
+
         # TODO(malfet): Is upper bound inclusive or exclusive?
-        upper_expr = f"{expr_str} > {self.index_to_str(size)}" if upper else ""
         if lower and upper:
-            line = f"if (({lower_expr}) && ({upper_expr})) return"
+            # Check both lower and upper bounds
+            condition = f"({expr_str} < 0 || {expr_str} >= {size_str})"
+        elif lower:
+            condition = f"{expr_str} < 0"
         else:
-            line = f"if ({lower_expr}{upper_expr}) return"
-        self.cse.generate(self.compute, line, assignment=False)
+            condition = f"{expr_str} >= {size_str}"
+
+        if self._load_mask:
+            condition = f"{condition} && {self._load_mask}"
+
+        self.cse.generate(self.compute, f"if ({condition}) return", assignment=False)
 
 
 class MetalScheduling(SIMDScheduling):
