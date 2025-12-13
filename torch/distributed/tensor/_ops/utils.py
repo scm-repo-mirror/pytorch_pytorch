@@ -27,6 +27,7 @@ from torch.distributed.tensor.placement_types import (
 )
 
 
+
 def replicate_op_strategy(op_schema: OpSchema) -> StrategyType:
     """
     Fallback strategy all use Replication()
