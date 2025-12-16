@@ -3142,6 +3142,12 @@ def _allowed_callable_ids() -> dict[int, str]:
 
 
 @FunctionIdSet
+def _leaf_function_ids() -> dict[int, str]:
+    rv: dict[int, str] = {}
+    return rv
+
+
+@FunctionIdSet
 def _disallowed_callable_ids() -> dict[int, str]:
     rv: dict[int, str] = {}
     return rv
@@ -3261,6 +3267,11 @@ def is_callable_allowed(obj: Any) -> bool:
 def is_nonstrict_trace_callable(obj: Any) -> bool:
     _maybe_init_lazy_module(obj)
     return id(obj) in _nonstrict_trace_callable_ids
+
+
+def is_leaf_function(obj: Any) -> bool:
+    _maybe_init_lazy_module(obj)
+    return id(obj) in _leaf_function_ids
 
 
 def is_callable_disallowed(obj: Any) -> bool:
@@ -3787,8 +3798,29 @@ The reason to have this flag is that if the upper level function call (e.g, f2) 
 we don't want to inline the lower level function call (e.g, f3) by default.
 """
 
+_force_inline = False
+
+import contextlib
+
+
+@contextlib.contextmanager
+def force_inline():
+    global _force_inline
+    old_val = _force_inline
+    try:
+        _force_inline = True
+        yield
+    finally:
+        _force_inline = old_val
+
 
 def check_verbose(obj: Any, is_inlined_call: bool = False) -> SkipResult:
+    if _force_inline:
+        return SkipResult(
+            False,
+            "don't skip since it's marked as force inline",
+        )
+
     if isinstance(
         obj,
         (
