@@ -33,14 +33,13 @@ IF(NOT MKLDNN_FOUND)
     endif()
     if(WIN32)
       # Windows
-      # set(SYCL_DNNL_HOST_COMPILER "DEFAULT")
-      set(SYCL_DNNL_HOST_COMPILER "cl")
+      set(DNNL_HOST_COMPILER "DEFAULT")
       set(SYCL_CXX_DRIVER "icx")
       set(DNNL_LIB_NAME "dnnl.lib")
     elseif(LINUX)
       # Linux
       # g++ is soft linked to /usr/bin/cxx, oneDNN would not treat it as an absolute path
-      set(SYCL_DNNL_HOST_COMPILER "g++")
+      set(DNNL_HOST_COMPILER "g++")
       set(SYCL_CXX_DRIVER "icpx")
       set(DNNL_LIB_NAME "libdnnl.a")
     else()
@@ -65,15 +64,15 @@ IF(NOT MKLDNN_FOUND)
       BUILD_IN_SOURCE 0
       CMAKE_ARGS  -DCMAKE_C_COMPILER=icx
       -DCMAKE_CXX_COMPILER=${SYCL_CXX_DRIVER}
-      -DCMAKE_C_COMPILER_LAUNCHER=${CLEANED_SYCL_COMPILER_LAUNCHER}
-      -DCMAKE_CXX_COMPILER_LAUNCHER=${CLEANED_SYCL_COMPILER_LAUNCHER}
+      -DCMAKE_C_COMPILER_LAUNCHER=${DNNL_HOST_COMPILER}
+      -DCMAKE_CXX_COMPILER_LAUNCHER=${DNNL_HOST_COMPILER}
       -DDNNL_GPU_RUNTIME=SYCL
       -DDNNL_CPU_RUNTIME=THREADPOOL
       -DDNNL_BUILD_TESTS=OFF
       -DDNNL_BUILD_EXAMPLES=OFF
       -DONEDNN_BUILD_GRAPH=ON
       -DDNNL_LIBRARY_TYPE=STATIC
-      -DDNNL_DPCPP_HOST_COMPILER=${SYCL_DNNL_HOST_COMPILER} # Use global cxx compiler as host compiler
+      -DDNNL_DPCPP_HOST_COMPILER=${DNNL_HOST_COMPILER} # Use global cxx compiler as host compiler
       -G ${CMAKE_GENERATOR} # Align Generator to Torch
       BUILD_COMMAND ${DNNL_MAKE_COMMAND}
       BUILD_BYPRODUCTS "xpu_mkldnn_proj-prefix/src/xpu_mkldnn_proj-build/src/${DNNL_LIB_NAME}"
